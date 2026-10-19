@@ -324,15 +324,158 @@ root@dev:/etc/rc0.d# readlink -f /etc/rcS.d/S01apparmor
 cat /etc/init.d/apparmor
 ```
 
+检查自启动服务状态：
 
+```bash
+chkconfig --list | grep ':on'       # RHEL 系
+sysv-rc-conf --list                  # Debian 系
+```
 
+### 5，处置流程
 
+```bash
+1. 备份可疑脚本文件 → /tmp/evidence/
+2. 停止对应进程（如果已运行）
+3. 删除可疑 init.d 脚本
+4. 删除所有 rcN.d 中指向该脚本的 S/K 链接
+5. 清理 rc.local 中的恶意行
+6. 复查确认无残留
+```
 
+## 三、Systemd体系排查
 
+### 3.1 排查位置总览
 
+| 路径                                                    | 说明                           |
+| :------------------------------------------------------ | :----------------------------- |
+| `/etc/systemd/system/`                                  | **管理员自定义单元，排查重点** |
+| `/run/systemd/system/`                                  | 运行时生成的单元               |
+| `/usr/lib/systemd/system/`（或 `/lib/systemd/system/`） | 软件包提供的默认单元           |
+| `~/.config/systemd/user/`                               | 用户级单元，容易被忽视         |
 
+### 3.2 列出已启用的服务
 
+```bash
+systemctl list-unit-files --type=service --state=enabled
+```
 
+# 定时任务排查
+
+列出当前用户的计划任务：`crontab -l`
+
+删除所有的计划任务：`crontab -r`
+
+```bash
+# 先看看系统有哪些用户
+cat /etc/passwd | cut -d: -f1
+
+# 查看指定用户的任务（需 root 权限）
+crontab -u 【用户名】 -l
+```
+
+逐个排查有登录权限的用户，尤其是`/bin/bash`结尾的。
+
+重点关注下列目录：
+
+```bash
+cat /etc/crontab                 # 系统主配置文件
+ls -la /etc/cron.d/              # 存放系统级独立任务配置的目录
+cat /etc/cron.d/*                # 查看里面的内容
+```
+
+按周期自动执行，看这些目录里有没有非系统自带的脚本*`update.sh`、`kworker`*等
+
+```bash
+ls -la /etc/cron.hourly/         # 每小时执行
+ls -la /etc/cron.daily/          # 每天执行
+ls -la /etc/cron.weekly/         # 每周执行
+ls -la /etc/cron.monthly/        # 每月执行
+```
+
+隐藏的定时任务：
+
+```bash
+/var/spool/cron/crontabs/ （Debian/Ubuntu）
+/var/spool/cron/ （RHEL）
+```
+
+at任务：一次性定时任务。
+
+```bash
+at -l
+```
+
+**systemctl list-timers --all**，systemd级别的cron
+
+```bash
+systemctl cat evil.timer	#查看定时器配置
+重点看 OnCalendar= 或 OnBootSec=，了解它的执行频率。
+
+systemctl cat evil.service  #查看实际执行的脚本
+重点看 ExecStart=。如果它指向 /tmp/xxx.sh，再去 cat /tmp/xxx.sh 看具体脚本内容。如果是指向一个不明二进制文件，可以查它的 md5sum 或者丢到微步、VirusTotal 看。
+
+systemctl show evil.timer -p FragmentPath  #看文件具体在哪
+
+stat /etc/systemd/system/evil.timer  #看创建或停止时间
+```
+
+中止
+
+```bash
+systemctl stop evil.timer
+systemctl disable evil.timer	#取消开机自启
+systemctl stop evil.service		#停止对应的服务
+
+#删除恶意文件
+rm -f /etc/systemd/system/evil.timer
+rm -f /etc/systemd/system/evil.service
+# 如果你在第一步发现它有依赖的其他脚本（比如 /usr/bin/evil.sh），也一并删掉
+rm -f /usr/bin/evil.sh
+
+# 刷新 systemd 缓存
+systemctl daemon-reload
+```
+
+验证清干净了吗
+
+```bash
+systemctl list-timers --all | grep evil
+```
+
+# 第三方软件漏洞
+
+及时更新 yum、 apt 等软件。
+
+# 检查异常文件
+
+查看敏感目录，如 /tmp 下的文件；
+
+同时注意隐藏文件，命名为..开头的；
+
+溯源出webshell、远控木马的创建时间，如何找出同一时间范围内创建的文件
+
+```bash
+#找出 opt下一天前访问过的文件
+find /opt -iname "*" -atime 1 -type f
+```
+
+# 检查系统日志
+
+核心位置：/var/log
+
+查看日志配置情况：more /etc/rsyslog.conf
+
+![image-20261019202133481](Linux入侵排查.assets/image-20261019202133481.png)
+
+# Linux杀毒软件
+
+## ClamAV
+
+http://www.clamav.net/download.html
+
+安装：apt install clamav
+
+clamscan -r /home
 
 
 
